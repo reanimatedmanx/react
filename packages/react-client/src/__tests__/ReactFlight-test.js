@@ -661,6 +661,18 @@ describe('ReactFlight', () => {
       `);
   });
 
+  it('can transport Date as a top-level value', async () => {
+    const date = new Date(0);
+    const transport = ReactNoopFlightServer.render(date);
+
+    let readValue;
+    await act(async () => {
+      readValue = await ReactNoopFlightClient.read(transport);
+    });
+
+    expect(readValue).toEqual(date);
+  });
+
   it('can transport Error objects as values', async () => {
     function ComponentClient({prop}) {
       return `
@@ -1334,7 +1346,10 @@ describe('ReactFlight', () => {
         errors: [
           {
             message: 'This is an error',
-            stack: gate(flags => flags.enableOwnerStacks)
+            stack: gate(
+              flags =>
+                flags.enableOwnerStacks || flags.enableServerComponentLogs,
+            )
               ? expect.stringContaining(
                   'Error: This is an error\n' +
                     '    at eval (eval at testFunction (eval at createFakeFunction (**), <anonymous>:1:35)\n' +
@@ -1366,7 +1381,17 @@ describe('ReactFlight', () => {
               ['file:///testing.js', 'Server'],
               [__filename, 'Server'],
             ]
-          : [],
+          : gate(flags => flags.enableServerComponentLogs)
+            ? [
+                // TODO: What should we request here? The outer (<anonymous>) or the inner (inspected-page.html)?
+                ['inspected-page.html:29:11), <anonymous>', 'Server'],
+                [
+                  'file://~/(some)(really)(exotic-directory)/ReactFlight-test.js',
+                  'Server',
+                ],
+                ['file:///testing.js', 'Server'],
+              ]
+            : [],
       });
     } else {
       expect(errors.map(getErrorForJestMatcher)).toEqual([
@@ -2928,7 +2953,11 @@ describe('ReactFlight', () => {
       .join('\n')
       .replaceAll(
         ' (/',
-        gate(flags => flags.enableOwnerStacks) ? ' (file:///' : ' (/',
+        gate(
+          flags => flags.enableOwnerStacks || flags.enableServerComponentLogs,
+        )
+          ? ' (file:///'
+          : ' (/',
       ); // The eval will end up normalizing these
 
     let sawReactPrefix = false;
@@ -2958,6 +2987,12 @@ describe('ReactFlight', () => {
     if (__DEV__ && gate(flags => flags.enableOwnerStacks)) {
       expect(environments.slice(0, 4)).toEqual([
         'Server',
+        'third-party',
+        'third-party',
+        'third-party',
+      ]);
+    } else if (__DEV__ && gate(flags => flags.enableServerComponentLogs)) {
+      expect(environments.slice(0, 3)).toEqual([
         'third-party',
         'third-party',
         'third-party',
@@ -3422,5 +3457,97 @@ describe('ReactFlight', () => {
         '\n    in foo (at **)',
     );
     expect(caughtError.digest).toBe('digest("my-error")');
+  });
+
+  // @gate __DEV__
+  it('can render deep but cut off JSX in debug info', async () => {
+    function createDeepJSX(n) {
+      if (n <= 0) {
+        return null;
+      }
+      return <div>{createDeepJSX(n - 1)}</div>;
+    }
+
+    function ServerComponent(props) {
+      return <div>not using props</div>;
+    }
+
+    const transport = ReactNoopFlightServer.render({
+      root: (
+        <ServerComponent>
+          {createDeepJSX(100) /* deper than objectLimit */}
+        </ServerComponent>
+      ),
+    });
+
+    await act(async () => {
+      const rootModel = await ReactNoopFlightClient.read(transport);
+      const root = rootModel.root;
+      const children = root._debugInfo[0].props.children;
+      expect(children.type).toBe('div');
+      expect(children.props.children.type).toBe('div');
+      ReactNoop.render(root);
+    });
+
+    expect(ReactNoop).toMatchRenderedOutput(<div>not using props</div>);
+  });
+
+  // @gate __DEV__
+  it('can render deep but cut off Map/Set in debug info', async () => {
+    function createDeepMap(n) {
+      if (n <= 0) {
+        return null;
+      }
+      const map = new Map();
+      map.set('key', createDeepMap(n - 1));
+      return map;
+    }
+
+    function createDeepSet(n) {
+      if (n <= 0) {
+        return null;
+      }
+      const set = new Set();
+      set.add(createDeepSet(n - 1));
+      return set;
+    }
+
+    function ServerComponent(props) {
+      return <div>not using props</div>;
+    }
+
+    const transport = ReactNoopFlightServer.render({
+      set: (
+        <ServerComponent
+          set={createDeepSet(100) /* deper than objectLimit */}
+        />
+      ),
+      map: (
+        <ServerComponent
+          map={createDeepMap(100) /* deper than objectLimit */}
+        />
+      ),
+    });
+
+    await act(async () => {
+      const rootModel = await ReactNoopFlightClient.read(transport);
+      const set = rootModel.set._debugInfo[0].props.set;
+      const map = rootModel.map._debugInfo[0].props.map;
+      expect(set instanceof Set).toBe(true);
+      expect(set.size).toBe(1);
+      // eslint-disable-next-line no-for-of-loops/no-for-of-loops
+      for (const entry of set) {
+        expect(entry instanceof Set).toBe(true);
+        break;
+      }
+
+      expect(map instanceof Map).toBe(true);
+      expect(map.size).toBe(1);
+      expect(map.get('key') instanceof Map).toBe(true);
+
+      ReactNoop.render(rootModel.set);
+    });
+
+    expect(ReactNoop).toMatchRenderedOutput(<div>not using props</div>);
   });
 });
